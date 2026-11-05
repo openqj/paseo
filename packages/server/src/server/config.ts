@@ -486,12 +486,15 @@ function resolveAuthConfig(
   persisted: ReturnType<typeof loadPersistedConfig>,
 ): PaseoDaemonConfig["auth"] {
   const envPassword = env.PASEO_PASSWORD?.trim();
-  if (envPassword) {
-    return { password: hashDaemonPassword(envPassword) };
-  }
-  return persisted.daemon?.auth?.password
-    ? { password: persisted.daemon.auth.password }
-    : undefined;
+  const password = envPassword
+    ? hashDaemonPassword(envPassword)
+    : persisted.daemon?.auth?.password;
+  const identity = persisted.daemon?.auth?.identity;
+  if (!password && !identity) return undefined;
+  return {
+    ...(password ? { password } : {}),
+    ...(identity ? { identity } : {}),
+  };
 }
 
 function resolveWorktreesRoot(

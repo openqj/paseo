@@ -85,6 +85,8 @@ export interface PaseoClientConfig {
   appVersion?: string;
   runtimeGeneration?: number | null;
   password?: string;
+  identityToken?: string;
+  identityTokenProvider?: () => string | undefined | Promise<string | undefined>;
   authHeader?: string;
   suppressSendErrors?: boolean;
   logger?: PaseoLogger;

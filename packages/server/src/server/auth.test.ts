@@ -191,6 +191,49 @@ describe("hello admission", () => {
     }
   });
 
+  test("admits only a Product Identity token for the configured account", async () => {
+    const input = {
+      passwordHash: undefined,
+      identity: { issuerUrl: "https://identity.example.test", accountId: "acct:owner" },
+      localCredential: null,
+      transport: "relay" as const,
+      fetchIdentityAccountId: async (_issuer: string, token: string) =>
+        token === "valid-short-lived-token" ? "acct:owner" : null,
+    };
+
+    await expect(
+      resolveSessionAdmission({
+        ...input,
+        credential: { kind: "identityToken", token: "valid-short-lived-token" },
+      }),
+    ).resolves.toMatchObject({
+      admission: { principalId: "identity:acct:owner" },
+    });
+    await expect(
+      resolveSessionAdmission({
+        ...input,
+        credential: { kind: "identityToken", token: "expired-token" },
+      }),
+    ).resolves.toEqual({ rejection: "incorrect_password" });
+    await expect(
+      resolveSessionAdmission({
+        ...input,
+        fetchIdentityAccountId: async () => "acct:someone-else",
+        credential: { kind: "identityToken", token: "other-account-token" },
+      }),
+    ).resolves.toEqual({ rejection: "incorrect_password" });
+    await expect(
+      resolveSessionAdmission({ ...input, credential: undefined }),
+    ).resolves.toEqual({ rejection: "password_required" });
+    await expect(
+      resolveSessionAdmission({
+        ...input,
+        passwordHash: CORRECT_PASSWORD_HASH,
+        credential: { kind: "password", password: "correct-password" },
+      }),
+    ).resolves.toEqual({ rejection: "incorrect_password" });
+  });
+
   test("writes a private rotating credential and reads it only for the matching target", async () => {
     const home = await mkdtemp(join(tmpdir(), "paseo-local-file-"));
     try {

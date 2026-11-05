@@ -508,7 +508,9 @@ it("installs and updates only the npm artifacts pinned by the plugin registry", 
   const { resolveNpm } = await import("./managed-source/npm.js");
   const npm = await startNpmRegistry(npmPluginPackages());
   const previous = process.env.npm_config_userconfig;
+  const previousRegistry = process.env.npm_config_registry;
   process.env.npm_config_userconfig = npm.userconfig;
+  process.env.npm_config_registry = npm.env.npm_config_registry;
   const home = await mkdtemp(path.join(tmpdir(), "paseo-registry-npm-"));
   roots.push(home);
   const intents: Array<string | string[] | undefined> = [];
@@ -559,5 +561,7 @@ it("installs and updates only the npm artifacts pinned by the plugin registry", 
     await npm.close();
     if (previous === undefined) delete process.env.npm_config_userconfig;
     else process.env.npm_config_userconfig = previous;
+    if (previousRegistry === undefined) delete process.env.npm_config_registry;
+    else process.env.npm_config_registry = previousRegistry;
   }
 }, 30_000);

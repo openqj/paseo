@@ -234,6 +234,27 @@
             "password": {
               "type": "string",
               "pattern": "^\\$2[aby]\\$\\d{2}\\$[./A-Za-z0-9]{53}$"
+            },
+            "identity": {
+              "type": "object",
+              "properties": {
+                "issuerUrl": {
+                  "type": "string",
+                  "format": "uri"
+                },
+                "accountId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "serverId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                }
+              },
+              "required": ["issuerUrl", "accountId"],
+              "additionalProperties": false
             }
           },
           "additionalProperties": false

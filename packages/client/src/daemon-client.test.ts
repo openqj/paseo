@@ -260,6 +260,7 @@ test("does not infer browser automation capabilities from Electron runtime", asy
     .parse(JSON.parse(assertStr(mock.sent[0])));
   expect(hello.capabilities[CLIENT_CAPS.browserHost]).toBeUndefined();
   expect(hello.capabilities[CLIENT_CAPS.selectiveAgentTimeline]).toBe(true);
+  expect(hello.capabilities[CLIENT_CAPS.agentTimelineDeliveryAcks]).toBeUndefined();
 });
 
 test("advertises consumer-provided browser automation capabilities", async () => {
@@ -878,6 +879,118 @@ test("keeps relay upgrade credentials out of the socket request", async () => {
   expect(requests[0]).toEqual({ url: "ws://relay.test/ws?role=client&serverId=srv_test&v=2" });
 });
 
+test("keeps Product Identity access tokens inside the encrypted hello", async () => {
+  const mock = createMockTransport();
+  const requests: Array<{ url: string; headers?: Record<string, string>; protocols?: string[] }> =
+    [];
+  const client = new DaemonClient({
+    url: "ws://relay.test/ws?role=client&serverId=srv_test&v=2",
+    clientId: "clsk_identity_token_test",
+    identityToken: "short-lived-identity-token",
+    e2ee: { enabled: true, daemonPublicKeyB64: "daemon-public-key" },
+    reconnect: { enabled: false },
+    transportFactory: (request) => {
+      requests.push(request);
+      return mock.transport;
+    },
+  });
+  clients.push(client);
+  void client.connect();
+  await vi.waitFor(() => expect(requests).toHaveLength(1));
+  expect(requests[0]).toEqual({ url: "ws://relay.test/ws?role=client&serverId=srv_test&v=2" });
+});
+
+test("starts the Relay transport while an Identity token is resolving", async () => {
+  const mock = createMockTransport();
+  let rejectIdentityToken!: (error: Error) => void;
+  const identityToken = new Promise<string>((_resolve, reject) => {
+    rejectIdentityToken = reject;
+  });
+  const requests: Array<{ url: string; headers?: Record<string, string>; protocols?: string[] }> =
+    [];
+  const client = new DaemonClient({
+    url: "wss://relay.test/ws?role=client&serverId=srv_test&v=2",
+    clientId: "clsk_identity_parallel_connect_test",
+    identityTokenProvider: () => identityToken,
+    e2ee: { enabled: true, daemonPublicKeyB64: "daemon-public-key" },
+    reconnect: { enabled: false },
+    transportFactory: (request) => {
+      requests.push(request);
+      return mock.transport;
+    },
+  });
+  clients.push(client);
+
+  const pendingConnect = client.connect();
+  await vi.waitFor(() => expect(requests).toHaveLength(1));
+  expect(requests[0]).toEqual({ url: "wss://relay.test/ws?role=client&serverId=srv_test&v=2" });
+  expect(client.getConnectionState().status).toBe("connecting");
+
+  rejectIdentityToken(new Error("Identity token fetch failed"));
+  await expect(pendingConnect).rejects.toThrow("Identity token fetch failed");
+});
+
+test("applies the Relay connect timeout while an Identity token is resolving", async () => {
+  useHeartbeatClock();
+  try {
+    const mock = createMockTransport();
+    const identityToken = new Promise<string>(() => {});
+    const client = new DaemonClient({
+      url: "wss://relay.test/ws?role=client&serverId=srv_test&v=2",
+      clientId: "clsk_identity_connect_timeout_test",
+      identityTokenProvider: () => identityToken,
+      e2ee: { enabled: true, daemonPublicKeyB64: "daemon-public-key" },
+      connectTimeoutMs: 100,
+      reconnect: { enabled: false },
+      transportFactory: () => mock.transport,
+    });
+    clients.push(client);
+
+    const pendingConnect = client.connect().then(
+      () => undefined,
+      (error) => error as Error,
+    );
+    expect(client.getConnectionState().status).toBe("connecting");
+
+    await vi.advanceTimersByTimeAsync(99);
+    expect(client.getConnectionState().status).toBe("connecting");
+    await vi.advanceTimersByTimeAsync(1);
+    const error = await pendingConnect;
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toContain("Connection timed out");
+    expect(client.getConnectionState().status).toBe("disconnected");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("fetches a fresh Product Identity token for each relay reconnect", async () => {
+  const sockets: ReturnType<typeof createMockTransport>[] = [];
+  let tokenCount = 0;
+  const identityTokenProvider = vi.fn(async () => `identity-token-${++tokenCount}`);
+  const client = new DaemonClient({
+    url: "ws://relay.test/ws?role=client&serverId=srv_test&v=2",
+    clientId: "clsk_identity_reconnect_test",
+    identityTokenProvider,
+    e2ee: { enabled: true, daemonPublicKeyB64: "daemon-public-key" },
+    reconnect: { enabled: true, baseDelayMs: 1, maxDelayMs: 1 },
+    transportFactory: () => {
+      const socket = createMockTransport();
+      sockets.push(socket);
+      return socket.transport;
+    },
+  });
+  clients.push(client);
+  void client.connect();
+  await vi.waitFor(() => expect(sockets).toHaveLength(1));
+  expect(identityTokenProvider).toHaveBeenCalledTimes(1);
+
+  sockets[0]!.triggerClose({ code: 1006, reason: "network reset" });
+  await vi.waitFor(() => expect(sockets).toHaveLength(2));
+  expect(identityTokenProvider).toHaveBeenCalledTimes(2);
+  await client.close();
+});
+
 test("refuses relay password auth without an encrypted hello", async () => {
   const requests: unknown[] = [];
   const client = new DaemonClient({
@@ -1007,6 +1120,7 @@ test("advertises client capabilities in hello", async () => {
         supportedCommands: ["list_tabs"],
         hostKind: "desktop app",
       },
+      [CLIENT_CAPS.agentTimelineDeliveryAcks]: true,
     },
   });
   clients.push(client);
@@ -1024,6 +1138,7 @@ test("advertises client capabilities in hello", async () => {
     capabilities: {
       all_providers: true,
       selective_agent_timeline: true,
+      agent_timeline_delivery_acks: true,
       timeline_replacement_invalidation: true,
       provider_snapshot_references: true,
       explicit_event_subscriptions: true,
@@ -1072,6 +1187,39 @@ test("allows callers to disable default client capabilities", async () => {
     })
     .parse(JSON.parse(assertStr(mock.sent[0])));
   expect(hello.capabilities[CLIENT_CAPS.projectUpdates]).toBe(false);
+});
+
+test("sends timeline apply acknowledgements with the opaque delivery cursor", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "timeline_delivery_ack_test",
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen({ preserveSent: true });
+  await connectPromise;
+
+  client.acknowledgeAgentTimelineDelivery({
+    agentId: "agent-1",
+    deliveryId: "delivery-1",
+    epoch: "epoch-1",
+    seq: 42,
+  });
+
+  expect(JSON.parse(assertStr(mock.sent.at(-1)))).toEqual({
+    type: "session",
+    message: {
+      type: "agent.timeline.delivery.ack",
+      agentId: "agent-1",
+      deliveryId: "delivery-1",
+      epoch: "epoch-1",
+      seq: 42,
+    },
+  });
 });
 
 test("sends new-agent run options when creating schedules", async () => {

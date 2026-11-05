@@ -6,6 +6,7 @@ import { daemonRestartCommand } from "./restart.js";
 import { runSetPasswordCommand } from "./set-password.js";
 import { pairCommand } from "./pair.js";
 import { daemonReloadCommand } from "./reload.js";
+import { paseoHostRegisterCommand } from "./register.js";
 import { daemonConfigCommand } from "./config.js";
 import { withOutput } from "../../output/index.js";
 import { addJsonOption, addLocalDaemonOptions } from "../../utils/command-options.js";
@@ -21,6 +22,7 @@ export function createDaemonCommand(): Command {
     daemonReloadCommand(),
     pairCommand(),
     daemonConfigCommand(),
+    paseoHostRegisterCommand(),
   ])
     daemon.addCommand(command);
   addJsonOption(

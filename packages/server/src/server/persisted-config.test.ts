@@ -43,6 +43,44 @@ describe("PersistedConfigSchema daemon auth config", () => {
 
     expect(parsed.daemon?.auth?.password).toBe(hash);
   });
+
+  test("accepts account-scoped Identity auth for a paired daemon", () => {
+    const parsed = PersistedConfigSchema.parse({
+      daemon: {
+        auth: {
+          identity: {
+            issuerUrl: "https://identity.example.test",
+            accountId: "acct:owner",
+          },
+        },
+      },
+    });
+
+    expect(parsed.daemon?.auth?.identity).toEqual({
+      issuerUrl: "https://identity.example.test",
+      accountId: "acct:owner",
+    });
+  });
+
+  test("accepts a registered host server ID with a loopback Identity issuer", () => {
+    const parsed = PersistedConfigSchema.parse({
+      daemon: {
+        auth: {
+          identity: {
+            issuerUrl: "http://127.0.0.1:28087/",
+            accountId: "acct:owner",
+            serverId: "srv_local",
+          },
+        },
+      },
+    });
+
+    expect(parsed.daemon?.auth?.identity).toEqual({
+      issuerUrl: "http://127.0.0.1:28087/",
+      accountId: "acct:owner",
+      serverId: "srv_local",
+    });
+  });
 });
 
 describe("PersistedConfigSchema daemon append system prompt config", () => {

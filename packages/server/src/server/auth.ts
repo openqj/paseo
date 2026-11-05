@@ -2,11 +2,17 @@ import { compare, hashSync } from "bcryptjs";
 import { timingSafeEqual } from "node:crypto";
 import type { RequestHandler } from "express";
 import { matchesLocalCredential } from "./local-credential.js";
+import { resolveIdentityTokenAccountId } from "./identity-token-auth.js";
 
 export const DAEMON_PASSWORD_BCRYPT_COST = 12;
 
 export interface DaemonAuthConfig {
   password?: string;
+  identity?: {
+    issuerUrl: string;
+    accountId: string;
+    serverId?: string;
+  };
   localCredential?: () => string | null;
 }
 
@@ -79,8 +85,9 @@ export function createRequireBearerMiddleware(
   onReject?: (context: BearerAuthRejectContext) => void,
 ): RequestHandler {
   const password = auth?.password;
+  const identity = auth?.identity;
   return (req, res, next) => {
-    if (!password || shouldBypassBearerAuth(req.method, req.path)) {
+    if ((!password && !identity) || shouldBypassBearerAuth(req.method, req.path)) {
       next();
       return;
     }
@@ -94,7 +101,13 @@ export function createRequireBearerMiddleware(
           localCredential !== undefined &&
           token !== null &&
           matchesLocalCredential(localCredential, token);
-        if (!isLocal && !(await isBearerTokenValidAsync({ password, token }))) {
+        const identityAccountId =
+          identity && token
+            ? await resolveIdentityTokenAccountId(identity.issuerUrl, token, identity.serverId)
+            : null;
+        const identityValid = identityAccountId === identity?.accountId;
+        const passwordValid = password ? await isBearerTokenValidAsync({ password, token }) : false;
+        if (!isLocal && !identityValid && !passwordValid) {
           onReject?.({
             path: req.path,
             method: req.method,

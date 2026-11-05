@@ -141,8 +141,13 @@ test("a plain client advertises every protocol capability and no browser host", 
     const ready = h.client.connect();
     h.open();
     await ready;
-    const { browserHost: _browser, ...protocolCapabilities } = CLIENT_CAPS;
+    const {
+      browserHost: _browser,
+      agentTimelineDeliveryAcks: _deliveryAcks,
+      ...protocolCapabilities
+    } = CLIENT_CAPS;
     // Every new capability needs a deliberate default or a host-owned exception.
+    expect(h.sent[0].capabilities[CLIENT_CAPS.agentTimelineDeliveryAcks]).toBeUndefined();
     expect(h.sent).toHaveLength(1);
     expect(h.sent[0].capabilities).toEqual(
       Object.fromEntries(Object.values(protocolCapabilities).map((key) => [key, true])),

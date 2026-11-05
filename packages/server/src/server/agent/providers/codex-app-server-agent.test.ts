@@ -1904,6 +1904,45 @@ describe("Codex app-server provider", () => {
     appServer.assertNoErrors();
   });
 
+  test("retries a provider-mismatched thread in an app-server configured for its provider", async () => {
+    const initialServer = createFakeCodexAppServer({
+      "thread/resume": () => ({
+        __jsonRpcError: {
+          code: -32600,
+          message:
+            "This chat uses custom, but your current provider is openai. Switch to custom to continue.",
+          data: {
+            type: "modelProviderMismatch",
+            modelProvider: "custom",
+            currentModelProvider: "openai",
+          },
+        },
+      }),
+    });
+    const customServer = createFakeCodexAppServer();
+    const provider = createProviderWithFakeAppServer(initialServer);
+    const spawnedModelProviders: Array<string | null> = [];
+    castInternals<{
+      spawnAppServer: (
+        launchEnv?: Record<string, string>,
+        options?: { modelProvider?: string },
+      ) => Promise<ChildProcessWithoutNullStreams>;
+    }>(provider).spawnAppServer = async (_launchEnv, options) => {
+      spawnedModelProviders.push(options?.modelProvider ?? null);
+      return options?.modelProvider === "custom" ? customServer.child : initialServer.child;
+    };
+
+    const session = await provider.resumeSession(archivedThreadHandle());
+
+    expect(spawnedModelProviders).toEqual([null, "custom"]);
+    expect(
+      customServer.requests().find((request) => request.method === "thread/resume"),
+    ).toMatchObject({ params: { threadId: "archived-thread-id" } });
+    await session.close();
+    initialServer.assertNoErrors();
+    customServer.assertNoErrors();
+  });
+
   test("closes Codex app-server when archived history hydration fails", async () => {
     const appServer = createFakeCodexAppServer({
       "thread/resume": () =>

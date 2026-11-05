@@ -199,4 +199,21 @@ describe("WebSocketRuntimeMetricsWindow", () => {
     expect(secondSnapshot.inboundSessionRequestTypesTop).toEqual([]);
     expect(secondSnapshot.latency).toEqual([]);
   });
+
+  it("reports p50, p95, and p99 server-side timeline send-to-apply-ack RTT", () => {
+    const { metrics } = createMetricsWindow();
+    for (let sample = 1; sample <= 100; sample++) {
+      metrics.recordAgentTimelineSendToApplyAckRtt(sample);
+    }
+
+    expect(metrics.snapshotAndReset().agentTimelineSendToApplyAckRtt).toEqual({
+      count: 100,
+      minMs: 1,
+      maxMs: 100,
+      p50Ms: 50,
+      p95Ms: 95,
+      p99Ms: 99,
+    });
+    expect(metrics.snapshotAndReset().agentTimelineSendToApplyAckRtt.count).toBe(0);
+  });
 });

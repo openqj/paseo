@@ -192,12 +192,14 @@ async function waitForCapturedLog(
 (shouldRunRelayE2e ? describe : describe.skip)("Relay transport (E2EE) - daemon E2E", () => {
   let relayPort: number;
   let relayProcess: ChildProcess | null = null;
+  let relayPersistenceDir: string | null = null;
   let relayStdoutLines: string[] = [];
 
   const startRelay = async (options: { useLocalRelay?: boolean } = {}) => {
     relayStdoutLines = [];
     relayPort = await getAvailablePort();
     const relayDir = path.resolve(process.cwd(), "../relay");
+    relayPersistenceDir = await mkdtemp(path.join(os.tmpdir(), "paseo-relay-wrangler-state-"));
     const relayArgs = [
       "wrangler",
       "dev",
@@ -208,6 +210,8 @@ async function waitForCapturedLog(
       String(relayPort),
       "--live-reload=false",
       "--show-interactive-dev-session=false",
+      "--persist-to",
+      relayPersistenceDir,
     ];
     if (options.useLocalRelay) {
       relayArgs.push("--var", "PASEO_RELAY_UPSTREAM:");
@@ -216,7 +220,7 @@ async function waitForCapturedLog(
       process.execPath,
       [
         "--experimental-vm-modules",
-        path.resolve(relayDir, "../../node_modules/wrangler/wrangler-dist/cli.js"),
+          path.resolve(relayDir, "node_modules/wrangler/wrangler-dist/cli.js"),
         ...relayArgs.slice(1),
       ],
       {
@@ -249,14 +253,31 @@ async function waitForCapturedLog(
       }
     });
 
-    await waitForServer(relayPort, 30000);
-    await waitForRelayWebSocketReady(relayPort, 60000);
+    try {
+      await waitForServer(relayPort, 30000);
+      await waitForRelayWebSocketReady(relayPort, 60000);
+    } catch (error) {
+      await stopRelay();
+      throw error;
+    }
   };
 
   const stopRelay = async () => {
-    if (!relayProcess) return;
-    relayProcess.kill("SIGTERM");
-    relayProcess = null;
+    if (relayProcess) {
+      const processToStop = relayProcess;
+      relayProcess = null;
+      if (processToStop.exitCode === null && processToStop.signalCode === null) {
+        await new Promise<void>((resolve) => {
+          processToStop.once("close", () => resolve());
+          processToStop.kill("SIGTERM");
+        });
+      }
+    }
+    if (relayPersistenceDir) {
+      const persistenceDir = relayPersistenceDir;
+      relayPersistenceDir = null;
+      await rm(persistenceDir, { recursive: true, force: true });
+    }
   };
 
   test("oversized attachments fail without disconnecting or resubmitting over the relay", async () => {

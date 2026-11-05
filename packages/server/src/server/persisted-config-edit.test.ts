@@ -19,6 +19,7 @@ test("configuration edits validate before writing and preserve unrelated setting
       "unknown",
       "daemon.missing",
       "daemon.__proto__.listen",
+      "daemon.auth",
       "daemon.auth.password",
     ]) {
       expect(() => editPersistedConfig(home, field, { value: "value" })).toThrow();
@@ -26,6 +27,18 @@ test("configuration edits validate before writing and preserve unrelated setting
     }
     editPersistedConfig(home, "daemon.listen", { value: "127.0.0.1:12345" });
     editPersistedConfig(home, "features.webUi.enabled", { value: true });
+    editPersistedConfig(home, "daemon.auth.identity", {
+      value: {
+        issuerUrl: "https://identity.example.test",
+        accountId: "acct:owner",
+        serverId: "srv_local",
+      },
+    });
+    expect(getPersistedConfigValue(readPersistedConfig(home), "daemon.auth.identity")).toEqual({
+      issuerUrl: "https://identity.example.test",
+      accountId: "acct:owner",
+      serverId: "srv_local",
+    });
     const before = await readFile(path.join(home, "config.json"), "utf8");
     expect(() => editPersistedConfig(home, "features.webUi.enabled", { value: "true" })).toThrow();
     expect(() =>

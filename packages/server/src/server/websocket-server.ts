@@ -177,6 +177,18 @@ type WebSocketRuntimeMetricsLogPayload = Omit<WebSocketRuntimeDiagnosticPayload,
 
 type TerminalAttentionReason = "finished" | "needs_input";
 
+function getAgentTimelineDeliveryId(message: WSOutboundMessage): string | null {
+  if (message.type !== "session") return null;
+  const sessionMessage = message.message;
+  if (sessionMessage.type === "agent_stream" && sessionMessage.payload.event.type === "timeline") {
+    return sessionMessage.payload.deliveryId ?? null;
+  }
+  if (sessionMessage.type === "fetch_agent_timeline_response") {
+    return sessionMessage.payload.deliveryId ?? null;
+  }
+  return null;
+}
+
 function resolveTerminalAttentionReason(input: {
   attentionReason?: TerminalActivity["attentionReason"];
   previousState: "working" | "idle" | "attention" | null;
@@ -471,6 +483,7 @@ interface SocketSessionOptions {
   onBinaryMessageToSource?: (source: object, frame: Uint8Array) => Promise<void>;
   getTransportBufferedAmount?: (source?: object) => number | null;
   onLifecycleIntent?: (intent: SessionLifecycleIntent) => void;
+  onAgentTimelineReceiptAck?: SessionOptions["onAgentTimelineReceiptAck"];
   hubExecutionAgents?: HubExecutionAgents;
   hubRelationships?: HubRelationshipManagement;
 }
@@ -924,11 +937,18 @@ export class VoiceAssistantWebSocketServer {
     ws.pause();
     try {
       // COMPAT(headerAuth): added in v0.9.1, remove after 2027-03-24.
-      const protocol = extractWsBearerProtocol(request.headers["sec-websocket-protocol"]);
-      const token =
-        extractHttpBearerToken(request.headers.authorization) ?? extractWsBearerToken(protocol);
+      // Header bearer admission is a legacy daemon-password path. Product
+      // Identity credentials must be validated from the hello message so a
+      // caller cannot turn an arbitrary HTTP/subprotocol token into owner access.
+      const allowPasswordHeaderAuth = Boolean(password && !this.credentialSource?.identity);
+      const protocol = allowPasswordHeaderAuth
+        ? extractWsBearerProtocol(request.headers["sec-websocket-protocol"])
+        : null;
+      const token = allowPasswordHeaderAuth
+        ? (extractHttpBearerToken(request.headers.authorization) ?? extractWsBearerToken(protocol))
+        : null;
       const hasHeaderCredential = token !== null;
-      if (password && hasHeaderCredential) {
+      if (password && allowPasswordHeaderAuth && hasHeaderCredential) {
         const requestMetadata = extractSocketRequestMetadata(request);
         const isAuthorized = await isBearerTokenValidAsync({ password, token });
         if (!isAuthorized) {
@@ -1192,8 +1212,11 @@ export class VoiceAssistantWebSocketServer {
     }
 
     const payloadBytes = outboundFrameByteLength(payload);
+    const deliveryId = getAgentTimelineDeliveryId(message);
     for (const ws of writableSockets) {
       this.sendFrameToClient(ws, payload, payloadBytes, () => {
+        if (deliveryId)
+          this.sessions.get(ws)?.session.recordAgentTimelineDeliverySent(ws, deliveryId);
         this.runtimeMetrics.recordOutboundMessage(message, ws.bufferedAmount);
       });
     }
@@ -1439,6 +1462,9 @@ export class VoiceAssistantWebSocketServer {
       onLifecycleIntent: (intent) => {
         this.onLifecycleIntent?.(intent);
       },
+      onAgentTimelineReceiptAck: (receipt) => {
+        this.runtimeMetrics.recordAgentTimelineSendToApplyAckRtt(receipt.durationMs);
+      },
       hubExecutionAgents: admission.hubExecutionAgents,
       hubRelationships: this.hubRelationships ?? undefined,
     });
@@ -1474,6 +1500,7 @@ export class VoiceAssistantWebSocketServer {
       onBinaryMessageToSource: options.onBinaryMessageToSource,
       getTransportBufferedAmount: options.getTransportBufferedAmount,
       onLifecycleIntent: options.onLifecycleIntent,
+      onAgentTimelineReceiptAck: options.onAgentTimelineReceiptAck,
       logger: options.connectionLogger.child({ module: "session" }),
       onWorkspaceRecovered: async (workspace) => {
         await Promise.all(
@@ -1691,6 +1718,7 @@ export class VoiceAssistantWebSocketServer {
       const resolved = await resolveSessionAdmission({
         credential: message.auth,
         passwordHash: this.passwordHash,
+        identity: this.credentialSource?.identity,
         localCredential: this.credentialSource?.localCredential?.() ?? null,
         transport: pending.identity.transport === "relay" ? "relay" : "direct",
       });
@@ -2549,6 +2577,7 @@ export class VoiceAssistantWebSocketServer {
       memory: getProcessMemoryDiagnostics(),
       runtime: sessionMetrics,
       latency: runtimeMetrics.latency,
+      agentTimelineSendToApplyAckRtt: runtimeMetrics.agentTimelineSendToApplyAckRtt,
       agents: agentSnapshot,
       git: {
         commands: gitCommandMetrics,

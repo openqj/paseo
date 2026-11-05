@@ -97,6 +97,14 @@ describe("pull request timeline message schemas", () => {
     });
   });
 
+  test("defaults an omitted response payload", () => {
+    const parsed = PullRequestTimelineResponseSchema.parse({
+      type: "pull_request_timeline_response",
+    });
+
+    expect(parsed.payload).toMatchObject({ cwd: "", requestId: "", items: [] });
+  });
+
   test("normalizes unknown timeline item kinds to comments", () => {
     const parsed = PullRequestTimelineResponseSchema.parse({
       type: "pull_request_timeline_response",

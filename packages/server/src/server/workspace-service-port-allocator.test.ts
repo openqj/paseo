@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -48,6 +48,7 @@ describe("allocateWorkspaceServicePort", () => {
   it("passes service and workspace context to portScript", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "workspace-service-port-allocator-"));
     tempDirs.push(tempDir);
+    const resolvedTempDir = realpathSync(tempDir);
     const port = await getFreePort();
     const scriptPath = createContextPortScript(tempDir, port);
 
@@ -60,7 +61,7 @@ describe("allocateWorkspaceServicePort", () => {
         branchName: "feature/allocator-context",
       }),
     ).resolves.toBe(port);
-    expect(readFileSync(join(tempDir, "cwd"), "utf8")).toBe(tempDir);
+    expect(readFileSync(join(tempDir, "cwd"), "utf8")).toBe(resolvedTempDir);
     expect(readFileSync(join(tempDir, "argv"), "utf8")).toBe(
       `app-server|wks_port_allocator|feature/allocator-context|${tempDir}`,
     );

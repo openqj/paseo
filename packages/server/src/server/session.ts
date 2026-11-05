@@ -15,6 +15,10 @@ import type { MessageReceipts } from "./message-receipts/index.js";
 import equal from "fast-deep-equal";
 import { WorkspaceSetupObservation } from "./workspace-setup-observation.js";
 import { SessionDelivery, type OwnedSubscription } from "./session/owned-subscriptions/index.js";
+import {
+  AgentTimelineReceiptTracker,
+  type AgentTimelineReceiptAck,
+} from "./session/agent-timeline-receipts.js";
 import { v4 as uuidv4 } from "uuid";
 import { lstat, mkdir, mkdtemp, rename, rm, stat } from "node:fs/promises";
 import { basename, join, resolve, sep } from "path";
@@ -452,6 +456,7 @@ export interface SessionOptions {
   onBinaryMessage?: (frame: Uint8Array) => void;
   onBinaryMessageToSource?: (source: object, frame: Uint8Array) => Promise<void>;
   getTransportBufferedAmount?: (source?: object) => number | null;
+  onAgentTimelineReceiptAck?: (receipt: AgentTimelineReceiptAck) => void;
   onLifecycleIntent?: (intent: SessionLifecycleIntent) => void;
   onWorkspaceRecovered?: (workspace: PersistedWorkspaceRecord) => Promise<void>;
   publishScriptStatusUpdate?: (message: ScriptStatusUpdateMessage) => void;
@@ -714,6 +719,7 @@ export class Session {
     | null;
   private readonly getTransportBufferedAmount: (source?: object) => number | null;
   private readonly onLifecycleIntent: ((intent: SessionLifecycleIntent) => void) | null;
+  private readonly onAgentTimelineReceiptAck: ((receipt: AgentTimelineReceiptAck) => void) | null;
   private readonly onWorkspaceRecovered:
     | ((workspace: PersistedWorkspaceRecord) => Promise<void>)
     | null;
@@ -752,6 +758,7 @@ export class Session {
     string,
     { owner: OwnedSubscription; agentIds: Set<string> }
   >();
+  private readonly agentTimelineReceiptTracker = new AgentTimelineReceiptTracker();
   private readonly clientSources = new Map<
     object,
     {
@@ -816,6 +823,7 @@ export class Session {
       onBinaryMessageToSource,
       getTransportBufferedAmount,
       onLifecycleIntent,
+      onAgentTimelineReceiptAck,
       onWorkspaceRecovered,
       publishScriptStatusUpdate,
       logger,
@@ -873,6 +881,7 @@ export class Session {
     this.onBinaryMessageToSource = onBinaryMessageToSource ?? null;
     this.getTransportBufferedAmount = getTransportBufferedAmount ?? (() => 0);
     this.onLifecycleIntent = onLifecycleIntent ?? null;
+    this.onAgentTimelineReceiptAck = onAgentTimelineReceiptAck ?? null;
     this.onWorkspaceRecovered = onWorkspaceRecovered ?? null;
     this.pushNotifications = pushNotifications;
     this.paseoHome = paseoHome;
@@ -1291,6 +1300,7 @@ export class Session {
   }
 
   clearAgentTimelineSubscription(source: object): void {
+    this.agentTimelineReceiptTracker.forgetSource(source);
     void this.delivery
       .detach(source)
       .catch((err) => this.sessionLogger.error({ err }, "Failed to release source subscriptions"));
@@ -1353,7 +1363,7 @@ export class Session {
         !this.supportsTimelineItem(serializedEvent.item, source)
       )
         continue;
-      subscription.owner.emit(message);
+      subscription.owner.emit(this.agentTimelineMessageForSource(message, source));
     }
     // COMPAT(ownedSubscriptions): added in v0.8.0, remove implicit timeline delivery after 2027-03-09.
     for (const [source, { capabilities }] of this.clientSources) {
@@ -1368,7 +1378,8 @@ export class Session {
         (subscription) =>
           subscription.owner.source === source && subscription.agentIds.has(event.agentId),
       );
-      if (!alreadyDelivered) this.onMessageToSource?.(source, message);
+      if (!alreadyDelivered)
+        this.onMessageToSource?.(source, this.agentTimelineMessageForSource(message, source));
     }
     if (
       this.clientSources.size === 0 &&
@@ -2076,6 +2087,35 @@ export class Session {
     };
   }
 
+  private agentTimelineMessageForSource(
+    message: SessionOutboundMessage,
+    source: object,
+  ): SessionOutboundMessage {
+    if (
+      message.type !== "agent_stream" ||
+      message.payload.event.type !== "timeline" ||
+      !this.supportsForSource(CLIENT_CAPS.agentTimelineDeliveryAcks, source) ||
+      typeof message.payload.seq !== "number" ||
+      typeof message.payload.epoch !== "string"
+    ) {
+      return message;
+    }
+    const deliveryId = uuidv4();
+    this.agentTimelineReceiptTracker.register(deliveryId, source, {
+      agentId: message.payload.agentId,
+      epoch: message.payload.epoch,
+      seq: message.payload.seq,
+    });
+    return {
+      ...message,
+      payload: { ...message.payload, deliveryId },
+    };
+  }
+
+  public recordAgentTimelineDeliverySent(source: object, deliveryId: string): void {
+    this.agentTimelineReceiptTracker.markSent(deliveryId, source);
+  }
+
   private async enrichAgentPayload(payload: AgentSnapshotPayload): Promise<AgentSnapshotPayload> {
     const storedRecord = await this.agentStorage.get(payload.id);
     payload.title = storedRecord?.title ?? null;
@@ -2713,6 +2753,17 @@ export class Session {
     source?: object,
   ): Promise<void> | undefined {
     switch (msg.type) {
+      case "agent.timeline.delivery.ack": {
+        if (!source || !this.supportsForSource(CLIENT_CAPS.agentTimelineDeliveryAcks, source))
+          return undefined;
+        const receipt = this.agentTimelineReceiptTracker.acknowledge(msg.deliveryId, source, {
+          agentId: msg.agentId,
+          epoch: msg.epoch,
+          seq: msg.seq ?? null,
+        });
+        if (receipt) this.onAgentTimelineReceiptAck?.(receipt);
+        return undefined;
+      }
       case "fetch_agent_timeline_request":
         return this.handleFetchAgentTimelineRequest(msg, source);
       case "agent.timeline.append.request":
@@ -7827,6 +7878,19 @@ export class Session {
       const entries = selectedTimeline.entries.filter((entry) =>
         this.supportsTimelineItem(entry.item, source),
       );
+      let deliveryId: string | undefined;
+      if (
+        msg.trackDeliveryReceipt === true &&
+        source &&
+        this.supportsForSource(CLIENT_CAPS.agentTimelineDeliveryAcks, source)
+      ) {
+        deliveryId = uuidv4();
+        this.agentTimelineReceiptTracker.register(deliveryId, source, {
+          agentId: msg.agentId,
+          epoch: selectedTimeline.timeline.epoch,
+          seq: selectedTimeline.endSeq,
+        });
+      }
 
       this.emitForSource(
         {
@@ -7847,6 +7911,7 @@ export class Session {
             hasOlder: selectedTimeline.hasOlder,
             hasNewer: selectedTimeline.hasNewer,
             ...(msg.mergeWindow === true ? { mergeWindow: true } : {}),
+            ...(deliveryId ? { deliveryId } : {}),
             entries: entries.map((entry) => {
               const payloadEntry = {
                 provider: snapshot.provider,

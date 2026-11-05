@@ -43,6 +43,14 @@ export interface WebSocketRuntimeMetricsSnapshot {
     p50Ms: number;
     totalMs: number;
   }>;
+  agentTimelineSendToApplyAckRtt: {
+    count: number;
+    minMs: number;
+    maxMs: number;
+    p50Ms: number;
+    p95Ms: number;
+    p99Ms: number;
+  };
 }
 
 export interface WebSocketRuntimeDiagnosticSnapshot<
@@ -87,6 +95,7 @@ export class WebSocketRuntimeMetricsWindow {
   private readonly outboundBinaryFrameCounts = new Map<string, number>();
   private readonly bufferedAmountSamples: number[] = [];
   private readonly requestLatencies = new Map<string, number[]>();
+  private readonly agentTimelineSendToApplyAckRttSamples: number[] = [];
 
   constructor(private readonly clock: Clock = Date.now) {
     this.windowStartedAt = this.clock();
@@ -135,6 +144,11 @@ export class WebSocketRuntimeMetricsWindow {
     latencies.push(durationMs);
   }
 
+  recordAgentTimelineSendToApplyAckRtt(durationMs: number): void {
+    if (Number.isFinite(durationMs) && durationMs >= 0)
+      this.agentTimelineSendToApplyAckRttSamples.push(durationMs);
+  }
+
   snapshotAndReset(): WebSocketRuntimeMetricsSnapshot {
     const now = this.clock();
     const snapshot: WebSocketRuntimeMetricsSnapshot = {
@@ -149,6 +163,7 @@ export class WebSocketRuntimeMetricsWindow {
       outboundBinaryFrameTypesTop: getTopCounts(this.outboundBinaryFrameCounts, 12),
       bufferedAmount: this.computeBufferedAmountStats(),
       latency: this.computeLatencyStats(),
+      agentTimelineSendToApplyAckRtt: this.computeAgentTimelineSendToApplyAckRtt(),
     };
 
     this.reset(now);
@@ -200,6 +215,22 @@ export class WebSocketRuntimeMetricsWindow {
     };
   }
 
+  private computeAgentTimelineSendToApplyAckRtt(): WebSocketRuntimeMetricsSnapshot["agentTimelineSendToApplyAckRtt"] {
+    if (this.agentTimelineSendToApplyAckRttSamples.length === 0) {
+      return { count: 0, minMs: 0, maxMs: 0, p50Ms: 0, p95Ms: 0, p99Ms: 0 };
+    }
+    const samples = [...this.agentTimelineSendToApplyAckRttSamples].sort((a, b) => a - b);
+    const percentile = (p: number) => samples[Math.max(0, Math.ceil(samples.length * p) - 1)] ?? 0;
+    return {
+      count: samples.length,
+      minMs: Math.round(samples[0] ?? 0),
+      maxMs: Math.round(samples[samples.length - 1] ?? 0),
+      p50Ms: Math.round(percentile(0.5)),
+      p95Ms: Math.round(percentile(0.95)),
+      p99Ms: Math.round(percentile(0.99)),
+    };
+  }
+
   private reset(windowStartedAt: number): void {
     for (const counter of Object.keys(this.counters) as Array<keyof WebSocketRuntimeCounters>) {
       this.counters[counter] = 0;
@@ -213,6 +244,7 @@ export class WebSocketRuntimeMetricsWindow {
     this.outboundBinaryFrameCounts.clear();
     this.bufferedAmountSamples.length = 0;
     this.requestLatencies.clear();
+    this.agentTimelineSendToApplyAckRttSamples.length = 0;
     this.windowStartedAt = windowStartedAt;
   }
 }

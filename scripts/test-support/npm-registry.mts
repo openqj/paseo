@@ -96,7 +96,7 @@ export async function startNpmRegistry(packages: FixturePackage[]) {
     url,
     userconfig,
     requests,
-    env: { npm_config_userconfig: userconfig },
+    env: { npm_config_registry: `${url}/`, npm_config_userconfig: userconfig },
     setTag(packageName: string, tag: string, version: string) {
       const manifest = manifests.get(packageName);
       if (!manifest?.versions[version])

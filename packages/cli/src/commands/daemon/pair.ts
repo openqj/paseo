@@ -13,12 +13,16 @@ import type { DaemonTarget } from "../../utils/daemon-target.js";
 import { addJsonAndDaemonHostOptions, withGlobalOptions } from "../../utils/command-options.js";
 import { formatPairingInstructions } from "../../output/pairing.js";
 import { parseConnectionOfferFromUrl } from "@getpaseo/protocol/connection-offer";
-import { serializeRelayConnectionUri } from "@getpaseo/protocol/daemon-endpoints";
+import {
+  serializeRelayConnectionUri,
+  shouldUseTlsForDefaultHostedRelay,
+} from "@getpaseo/protocol/daemon-endpoints";
 
 interface PairOptions {
   daemonTarget: DaemonTarget;
   home?: string;
   json?: boolean;
+  metadataOnly?: boolean;
   relay?: boolean;
 }
 
@@ -61,6 +65,7 @@ export function pairCommand(): Command {
   return addJsonAndDaemonHostOptions(
     new Command("pair").description("Print the daemon pairing QR code and link"),
   )
+    .option("--metadata-only", "Print only relay connection metadata as JSON; omit the pairing URL and QR")
     .option("--relay", "Enable relay without prompting")
     .action(
       withGlobalOptions((options: PairOptions, _command: Command) => runPairCommand(options)),
@@ -199,6 +204,26 @@ function outputPairingResult(
 
   const offer = parseConnectionOfferFromUrl(pairing.url);
   const connectionUri = offer ? serializeRelayConnectionUri({ offer }) : null;
+
+  if (options.metadataOnly) {
+    if (!offer) {
+      output.writeStderr(`${JSON.stringify({ code: "INVALID_OFFER", message: "Pairing metadata is unavailable." })}\n`);
+      output.setExitCode(1);
+      return;
+    }
+    output.writeStdout(
+      `${JSON.stringify({
+        relayEnabled: pairing.relayEnabled,
+        serverId: offer.serverId,
+        daemonPublicKeyB64: offer.daemonPublicKeyB64,
+        relay: {
+          endpoint: offer.relay.endpoint,
+          useTls: offer.relay.useTls ?? shouldUseTlsForDefaultHostedRelay(offer.relay.endpoint),
+        },
+      })}\n`,
+    );
+    return;
+  }
 
   if (options.json) {
     output.writeStdout(

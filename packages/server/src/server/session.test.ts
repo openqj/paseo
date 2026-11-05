@@ -326,6 +326,7 @@ interface SessionForTestOptions {
   daemonRuntimeConfig?: SessionOptions["daemonRuntimeConfig"];
   downloadTokenStore?: SessionOptions["downloadTokenStore"];
   pushNotifications?: SessionOptions["pushNotifications"];
+  onAgentTimelineReceiptAck?: SessionOptions["onAgentTimelineReceiptAck"];
   messages?: unknown[];
   targetedMessages?: Array<{ source: object; message: SessionOutboundMessage }>;
   binaryMessages?: Uint8Array[];
@@ -381,6 +382,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
             messages.push(message),
         }),
     onBinaryMessage: createBinaryMessageHandler(options.binaryMessages),
+    onAgentTimelineReceiptAck: options.onAgentTimelineReceiptAck,
     logger,
     downloadTokenStore: options.downloadTokenStore ?? asDownloadTokenStore(),
     pushNotifications: options.pushNotifications ?? asPushNotifications(),
@@ -5239,6 +5241,127 @@ test("acknowledges a timeline subscription only to its socket source", async () 
       },
     },
   ]);
+});
+
+test("tracks apply acknowledgements only for opted-in timeline sources and matching cursors", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const targetedMessages: Array<{ source: object; message: SessionOutboundMessage }> = [];
+  const agentEventListeners: Array<(event: AgentManagerEvent) => void> = [];
+  const onAgentTimelineReceiptAck = vi.fn();
+  const session = createSessionForTest({
+    messages,
+    targetedMessages,
+    onAgentTimelineReceiptAck,
+    agentManager: {
+      getAgent: (id: string) => ({ id, internal: false }),
+      subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
+        agentEventListeners.push(listener);
+        return () => {};
+      }),
+    },
+  });
+  const ackSource = {};
+  const legacySource = {};
+  session.updateClientCapabilities(
+    {
+      selective_agent_timeline: true,
+      [CLIENT_CAPS.agentTimelineDeliveryAcks]: true,
+    },
+    ackSource,
+  );
+  session.updateClientCapabilities(null, legacySource);
+  await session.handleMessage(
+    {
+      type: "agent.timeline.set_subscription.request",
+      agentIds: ["agent-a"],
+      requestId: "timeline-subscription-ack",
+    },
+    ackSource,
+  );
+  targetedMessages.length = 0;
+
+  const listener = agentEventListeners[0];
+  if (!listener) throw new Error("Agent event listener was not installed");
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
+    epoch: "epoch-1",
+    seq: 7,
+    timestamp: "2026-10-23T00:00:00.000Z",
+    event: {
+      type: "timeline",
+      provider: "mock",
+      item: { type: "assistant_message", messageId: "message-a", text: "A" },
+    },
+  });
+
+  const capableDelivery = targetedMessages.find(({ source }) => source === ackSource)?.message;
+  const legacyDelivery = targetedMessages.find(({ source }) => source === legacySource)?.message;
+  expect(capableDelivery).toMatchObject({
+    type: "agent_stream",
+    payload: {
+      agentId: "agent-a",
+      epoch: "epoch-1",
+      seq: 7,
+      deliveryId: expect.any(String),
+    },
+  });
+  expect(legacyDelivery).toMatchObject({ type: "agent_stream" });
+  if (legacyDelivery?.type !== "agent_stream") throw new Error("Expected legacy delivery");
+  expect(legacyDelivery.payload).not.toHaveProperty("deliveryId");
+
+  if (capableDelivery?.type !== "agent_stream") throw new Error("Expected capable delivery");
+  const deliveryId = capableDelivery.payload.deliveryId;
+  if (!deliveryId) throw new Error("Capable delivery did not include its receipt ID");
+  session.recordAgentTimelineDeliverySent(ackSource, deliveryId);
+  await session.handleMessage(
+    {
+      type: "agent.timeline.delivery.ack",
+      agentId: "agent-a",
+      deliveryId,
+      epoch: "epoch-1",
+      seq: 8,
+    },
+    ackSource,
+  );
+  expect(onAgentTimelineReceiptAck).not.toHaveBeenCalled();
+
+  await session.handleMessage(
+    {
+      type: "agent.timeline.delivery.ack",
+      agentId: "agent-a",
+      deliveryId,
+      epoch: "epoch-1",
+      seq: 7,
+    },
+    legacySource,
+  );
+  expect(onAgentTimelineReceiptAck).not.toHaveBeenCalled();
+
+  await session.handleMessage(
+    {
+      type: "agent.timeline.delivery.ack",
+      agentId: "agent-a",
+      deliveryId,
+      epoch: "epoch-1",
+      seq: 7,
+    },
+    ackSource,
+  );
+  await session.handleMessage(
+    {
+      type: "agent.timeline.delivery.ack",
+      agentId: "agent-a",
+      deliveryId,
+      epoch: "epoch-1",
+      seq: 7,
+    },
+    ackSource,
+  );
+  expect(onAgentTimelineReceiptAck).toHaveBeenCalledOnce();
+  expect(onAgentTimelineReceiptAck).toHaveBeenCalledWith(
+    expect.objectContaining({ agentId: "agent-a", epoch: "epoch-1", seq: 7, deliveryId }),
+  );
 });
 
 test("unions viewed timelines across socket sources and removes detached sources", async () => {

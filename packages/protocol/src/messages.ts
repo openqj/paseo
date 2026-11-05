@@ -1879,6 +1879,16 @@ export const FetchAgentTimelineRequestMessageSchema = z.object({
   projection: z.enum(["projected", "canonical"]).optional(),
   // Allow the client to merge this bounded page outside its contiguous loaded range.
   mergeWindow: z.boolean().optional(),
+  // Ask the daemon to track one receipt for this snapshot response.
+  trackDeliveryReceipt: z.boolean().optional(),
+});
+
+export const AgentTimelineDeliveryAckMessageSchema = z.object({
+  type: z.literal("agent.timeline.delivery.ack"),
+  agentId: z.string().min(1),
+  deliveryId: z.string().min(1),
+  epoch: z.string().min(1),
+  seq: z.number().int().nonnegative().optional(),
 });
 
 export const AgentTimelineSearchRequestMessageSchema = z.object({
@@ -3291,6 +3301,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ShutdownServerRequestMessageSchema,
   RestartServerRequestMessageSchema,
   DaemonUpdateRequestMessageSchema,
+  AgentTimelineDeliveryAckMessageSchema,
   FetchAgentTimelineRequestMessageSchema,
   AgentTimelineSearchRequestMessageSchema,
   AgentTimelineListPromptsRequestMessageSchema,
@@ -4134,6 +4145,7 @@ export const AgentStreamMessageSchema = z.object({
     // Present for timeline events. Maps 1:1 to canonical in-memory timeline rows.
     seq: z.number().int().nonnegative().optional(),
     epoch: z.string().optional(),
+    deliveryId: z.string().min(1).optional(),
   }),
 });
 
@@ -4667,6 +4679,7 @@ export const FetchAgentTimelineResponseMessageSchema = z.object({
     hasNewer: z.boolean(),
     mergeWindow: z.boolean().optional(),
     entries: z.array(AgentTimelineEntryPayloadSchema),
+    deliveryId: z.string().min(1).optional(),
     error: z.string().nullable(),
   }),
 });
@@ -5821,7 +5834,6 @@ export const PullRequestTimelineResponseSchema = z.object({
       // daemon floor is >= v0.2.0.
       authState: ForgeAuthStateSchema,
     })
-    .optional()
     .prefault({}),
 });
 
@@ -7569,6 +7581,7 @@ export const WSHelloMessageSchema = z.object({
   auth: z
     .discriminatedUnion("kind", [
       z.object({ kind: z.literal("password"), password: z.string() }),
+      z.object({ kind: z.literal("identityToken"), token: z.string() }),
       z.object({ kind: z.literal("localCredential"), token: z.string() }),
     ])
     .optional(),
@@ -7589,6 +7602,7 @@ export const WSHelloMessageSchema = z.object({
       [CLIENT_CAPS.compactProviderSnapshots]: z.boolean().optional(),
       [CLIENT_CAPS.providerSnapshotReferences]: z.boolean().optional(),
       [CLIENT_CAPS.timelineReplacementInvalidation]: z.boolean().optional(),
+      [CLIENT_CAPS.agentTimelineDeliveryAcks]: z.boolean().optional(),
       [CLIENT_CAPS.timelineNotifications]: z.boolean().optional(),
       [CLIENT_CAPS.browserHost]: BrowserAutomationHostCapabilitySchema.optional(),
     })

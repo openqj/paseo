@@ -1,4 +1,5 @@
 import { WebSocket } from "ws";
+import { createServer } from "node:http";
 import { hash } from "bcryptjs";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -14,11 +15,13 @@ const CORRECT_PASSWORD_HASH = "$2b$12$OLxyuuP9uLK30Uzc4wQX0O6liuU/Q1t5P2b0Ebf36m
 function connectWebSocket(params: {
   port: number;
   protocol?: string;
+  headers?: Record<string, string>;
 }): Promise<{ ws: WebSocket; protocol: string }> {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(
       `ws://127.0.0.1:${params.port}/ws`,
       params.protocol ? [params.protocol] : undefined,
+      { headers: params.headers },
     );
     ws.once("open", () => resolve({ ws, protocol: ws.protocol }));
     ws.once("error", reject);
@@ -28,6 +31,7 @@ function connectWebSocket(params: {
 async function expectWebSocketCloses(params: {
   port: number;
   protocol?: string;
+  headers?: Record<string, string>;
   code: number;
   reason: string;
   hello?: Record<string, unknown>;
@@ -180,6 +184,107 @@ describe("daemon bearer auth", () => {
       ws.close();
     } finally {
       await daemonHandle.close();
+    }
+  });
+
+  test("does not treat an arbitrary WebSocket bearer header as Product Identity admission", async () => {
+    const daemonHandle = await createTestPaseoDaemon({
+      auth: {
+        identity: {
+          issuerUrl: "https://identity.example.test",
+          accountId: "acct:owner",
+        },
+      },
+    });
+    try {
+      const { ws } = await connectWebSocket({
+        port: daemonHandle.port,
+        headers: { Authorization: "Bearer attacker-controlled-token" },
+      });
+      try {
+        const outcome = await new Promise<
+          | { type: "admitted" }
+          | { type: "closed"; code: number; reason: string }
+          | { type: "timeout" }
+        >((resolve) => {
+          const timer = setTimeout(() => resolve({ type: "timeout" }), 1_000);
+          ws.on("message", (data) => {
+            const frame = JSON.parse(data.toString()) as {
+              type?: string;
+              message?: { payload?: { status?: string } };
+            };
+            if (frame.type === "session" && frame.message?.payload?.status === "server_info") {
+              clearTimeout(timer);
+              resolve({ type: "admitted" });
+            }
+          });
+          ws.once("close", (code, reason) => {
+            clearTimeout(timer);
+            resolve({ type: "closed", code, reason: reason.toString() });
+          });
+          ws.send(
+            JSON.stringify({
+              type: "hello",
+              clientId: "identity-header",
+              clientType: "cli",
+              protocolVersion: 1,
+            }),
+          );
+        });
+        expect(outcome).toEqual({ type: "closed", code: 4401, reason: "Password required" });
+      } finally {
+        ws.terminate();
+      }
+    } finally {
+      await daemonHandle.close();
+    }
+  });
+
+  test("admits a valid Product Identity token sent in the client hello", async () => {
+    const identityServer = createServer((request, response) => {
+      response.setHeader("content-type", "application/json");
+      if (request.headers.authorization === "Bearer valid-identity-token") {
+        response.end(JSON.stringify({ account_id: "acct:owner" }));
+      } else {
+        response.statusCode = 401;
+        response.end(JSON.stringify({ error: "Unauthorized" }));
+      }
+    });
+    await new Promise<void>((resolve, reject) => {
+      identityServer.once("error", reject);
+      identityServer.listen(0, "127.0.0.1", resolve);
+    });
+    const identityAddress = identityServer.address();
+    if (!identityAddress || typeof identityAddress === "string") {
+      throw new Error("Product Identity test server did not expose a TCP port");
+    }
+
+    let daemonHandle: Awaited<ReturnType<typeof createTestPaseoDaemon>> | undefined;
+    let client: DaemonClient | undefined;
+    try {
+      daemonHandle = await createTestPaseoDaemon({
+        auth: {
+          identity: {
+            issuerUrl: `http://127.0.0.1:${identityAddress.port}`,
+            accountId: "acct:owner",
+          },
+        },
+      });
+      client = new DaemonClient({
+        url: `ws://127.0.0.1:${daemonHandle.port}/ws`,
+        clientId: "product-identity-hello-test",
+        clientType: "browser",
+        identityToken: "valid-identity-token",
+        webSocketFactory: (url, options) =>
+          new WebSocket(url, options?.protocols, { headers: options?.headers }),
+        reconnect: { enabled: false },
+      });
+      await client.connect();
+      expect(client.getLastServerInfoMessage()?.serverId).toBe(daemonHandle.daemon.getServerId());
+    } finally {
+      await client?.close();
+      await daemonHandle?.close();
+      await new Promise<void>((resolve) => identityServer.close(() => resolve()));
     }
   });
 

@@ -1348,8 +1348,10 @@ export default function contribute() {
     const home = await mkdtemp(path.join(tmpdir(), "paseo-npm-service-"));
     roots.push(home);
     const previousConfig = process.env.npm_config_userconfig;
+    const previousRegistry = process.env.npm_config_registry;
     const previousPath = process.env.PATH;
     process.env.npm_config_userconfig = registry.userconfig;
+    process.env.npm_config_registry = registry.env.npm_config_registry;
     const store = createStore(home);
     const open = () =>
       bindTestSessionHost(
@@ -1546,6 +1548,8 @@ export default function contribute() {
       process.env.PATH = previousPath;
       if (previousConfig === undefined) delete process.env.npm_config_userconfig;
       else process.env.npm_config_userconfig = previousConfig;
+      if (previousRegistry === undefined) delete process.env.npm_config_registry;
+      else process.env.npm_config_registry = previousRegistry;
       await service.stopAllPlugins();
       await registry.close();
     }

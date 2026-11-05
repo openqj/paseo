@@ -137,6 +137,18 @@ function isArchivedCodexThreadResumeError(error: unknown, threadId: string): boo
   return error.message === expectedMessage;
 }
 
+function codexMismatchedModelProvider(error: unknown): string | null {
+  if (error instanceof CodexAppServerRpcError && error.code === -32600) {
+    const data = toObjectRecord(error.data);
+    if (data?.type === "modelProviderMismatch" && typeof data.modelProvider === "string") {
+      return data.modelProvider.trim() || null;
+    }
+  }
+  return error instanceof Error && error.cause !== undefined
+    ? codexMismatchedModelProvider(error.cause)
+    : null;
+}
+
 function isCodexAlreadyUnarchivedError(error: unknown, threadId: string): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return message.includes(`no archived rollout found for thread id ${threadId}`);
@@ -4062,8 +4074,10 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   private async ensureThreadLoaded(): Promise<void> {
-    if (!this.client || !this.currentThreadId) return;
-    const params: Record<string, unknown> = { threadId: this.currentThreadId };
+    const client = this.client;
+    const threadId = this.currentThreadId;
+    if (!client || !threadId) return;
+    const params: Record<string, unknown> = { threadId };
     const developerInstructions = composeSystemPromptParts(
       this.config.systemPrompt,
       this.config.daemonAppendSystemPrompt,
@@ -4076,25 +4090,24 @@ export class CodexAppServerAgentSession implements AgentSession {
       params.config = codexConfig;
     }
     try {
-      const loaded = toObjectRecord(await this.client.request("thread/loaded/list", {}));
+      const loaded = toObjectRecord(await client.request("thread/loaded/list", {}));
       const ids = Array.isArray(loaded?.data) ? loaded.data : [];
-      if (ids.includes(this.currentThreadId)) {
+      if (ids.includes(threadId)) {
         return;
       }
-      const response = await this.client.request("thread/resume", params);
+      const response = await client.request("thread/resume", params);
       this.rememberResolvedSandboxPolicy(response);
     } catch (error) {
-      const threadId = this.currentThreadId;
       const message = error instanceof Error ? error.message : String(error);
       if (isArchivedCodexThreadResumeError(error, threadId)) {
         try {
-          await this.client.request("thread/unarchive", { threadId });
+          await client.request("thread/unarchive", { threadId });
         } catch (unarchiveError) {
           if (!isCodexAlreadyUnarchivedError(unarchiveError, threadId)) {
             throw unarchiveError;
           }
         }
-        const response = await this.client.request("thread/resume", params);
+        const response = await client.request("thread/resume", params);
         this.rememberResolvedSandboxPolicy(response);
         this.logger.info({ threadId }, "Unarchived Codex thread to restore active Paseo agent");
         return;
@@ -7236,12 +7249,20 @@ export class CodexAppServerAgentClient implements AgentClient {
 
   private async spawnAppServer(
     launchEnv?: Record<string, string>,
-    options?: { goalsEnabled?: boolean; agentId?: string; environment?: Record<string, string> },
+    options?: {
+      goalsEnabled?: boolean;
+      agentId?: string;
+      environment?: Record<string, string>;
+      modelProvider?: string;
+    },
   ): Promise<ChildProcessWithoutNullStreams> {
     const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
     const args = [...launchPrefix.args, "app-server"];
     if (options?.goalsEnabled) {
       args.push("--enable", "goals");
+    }
+    if (options?.modelProvider) {
+      args.push("--config", `model_provider=${JSON.stringify(options.modelProvider)}`);
     }
     this.logger.trace(
       {
@@ -7314,25 +7335,40 @@ export class CodexAppServerAgentClient implements AgentClient {
     const goalsEnabled = await this.resolveGoalsEnabled();
     const autoReviewEnabled = await this.resolveAutoReviewEnabled();
     const environment = buildCodexAppServerEnv(this.runtimeSettings, launchContext?.env);
-    const session = new CodexAppServerAgentSession(
-      merged,
-      handle,
-      this.logger,
-      () =>
-        this.spawnAppServer(launchContext?.env, {
-          goalsEnabled,
-          agentId: launchContext?.agentId,
-          environment,
-        }),
-      { ...this.sessionDeps(launchContext?.env), environment },
-      false,
-      goalsEnabled,
-      autoReviewEnabled,
-      launchContext?.agentId,
-      options?.purpose ?? "interactive",
-    );
-    await session.connect();
-    return session;
+    const createSession = (modelProvider?: string) =>
+      new CodexAppServerAgentSession(
+        merged,
+        handle,
+        this.logger,
+        () =>
+          this.spawnAppServer(launchContext?.env, {
+            goalsEnabled,
+            agentId: launchContext?.agentId,
+            environment,
+            ...(modelProvider ? { modelProvider } : {}),
+          }),
+        { ...this.sessionDeps(launchContext?.env), environment },
+        false,
+        goalsEnabled,
+        autoReviewEnabled,
+        launchContext?.agentId,
+        options?.purpose ?? "interactive",
+      );
+    const session = createSession();
+    try {
+      await session.connect();
+      return session;
+    } catch (error) {
+      const modelProvider = codexMismatchedModelProvider(error);
+      if (!modelProvider) throw error;
+      this.logger.info(
+        { threadId: handle.sessionId, modelProvider },
+        "Retrying Codex thread with its stored model provider",
+      );
+      const retrySession = createSession(modelProvider);
+      await retrySession.connect();
+      return retrySession;
+    }
   }
 
   async listImportableSessions(

@@ -227,6 +227,7 @@ function compatibleBearerPassword(password: string | null): string | null {
 
 type HelloAuth =
   | { kind: "password"; password: string }
+  | { kind: "identityToken"; token: string }
   | { kind: "localCredential"; token: string }
   | undefined;
 
@@ -256,16 +257,20 @@ function authFailureFromLegacyClose(event: unknown): DaemonAuthFailureReason | n
 function chooseConnectionAuth(
   config: DaemonClientConfig,
   localCredential: string | undefined,
+  identityToken: string | undefined,
 ): { helloAuth: HelloAuth; headers: Record<string, string>; protocols?: string[] } {
   const password = normalizePassword(config.password);
   let helloAuth: HelloAuth;
   if (localCredential) helloAuth = { kind: "localCredential", token: localCredential };
+  else if (identityToken) helloAuth = { kind: "identityToken", token: identityToken };
   else if (password) helloAuth = { kind: "password", password };
   const headers: Record<string, string> = {};
-  const compatibleBearer = localCredential ? null : compatibleBearerPassword(password);
+  const compatibleBearer =
+    localCredential || identityToken ? null : compatibleBearerPassword(password);
   // COMPAT(headerAuth): added in v0.9.1, remove after 2027-03-24.
   if (compatibleBearer) headers.Authorization = `Bearer ${compatibleBearer}`;
-  else if (!localCredential && config.authHeader) headers.Authorization = config.authHeader;
+  else if (!localCredential && !identityToken && config.authHeader)
+    headers.Authorization = config.authHeader;
   return {
     helloAuth,
     headers,
@@ -276,11 +281,14 @@ function chooseConnectionAuth(
 function resolveConnectionAuth(
   config: DaemonClientConfig,
 ): ReturnType<typeof chooseConnectionAuth> | Promise<ReturnType<typeof chooseConnectionAuth>> {
-  const resolution = config.localCredential?.();
-  if (resolution instanceof Promise) {
-    return resolution.then((credential) => chooseConnectionAuth(config, credential));
+  const localResolution = config.localCredential?.();
+  const identityResolution = config.identityTokenProvider?.();
+  if (localResolution instanceof Promise || identityResolution instanceof Promise) {
+    return Promise.all([localResolution, identityResolution]).then(([credential, identityToken]) =>
+      chooseConnectionAuth(config, credential, identityToken ?? config.identityToken),
+    );
   }
-  return chooseConnectionAuth(config, resolution);
+  return chooseConnectionAuth(config, localResolution, identityResolution ?? config.identityToken);
 }
 
 function extractCorrelatedResponseIdentity(input: unknown): CorrelatedResponseIdentity | null {
@@ -397,6 +405,8 @@ export interface DaemonClientConfig {
   appVersion?: string;
   runtimeGeneration?: number | null;
   password?: string;
+  identityToken?: string;
+  identityTokenProvider?: () => string | undefined | Promise<string | undefined>;
   localCredential?: () => string | undefined | Promise<string | undefined>;
   authHeader?: string;
   suppressSendErrors?: boolean;
@@ -672,6 +682,7 @@ export interface FetchAgentTimelineOptions {
   limit?: number;
   projection?: FetchAgentTimelineProjection;
   mergeWindow?: boolean;
+  trackDeliveryReceipt?: boolean;
   requestId?: string;
   timeout?: number;
 }
@@ -1394,21 +1405,14 @@ export class DaemonClient {
       this.reconnectTimeout = null;
     }
 
+    let prefetchedTransport: DaemonTransport | undefined;
     try {
       const resolution = resolveConnectionAuth(this.config);
-      const selected = resolution instanceof Promise ? await resolution : resolution;
-      if (!this.shouldReconnect) return;
-      this.helloAuth = selected.helloAuth;
-      // Reconnect can overlap with browser close/error delivery ordering.
-      // Always dispose previous transport before constructing the next one.
-      this.disposeTransport();
+      const isRelayTransport = isRelayClientWebSocketUrl(this.config.url);
+      const shouldUseRelayE2ee = this.config.e2ee?.enabled === true && isRelayTransport;
       const baseTransportFactory =
         this.config.transportFactory ??
         createWebSocketTransportFactory(this.config.webSocketFactory ?? defaultWebSocketFactory);
-      const isRelayTransport = isRelayClientWebSocketUrl(this.config.url);
-      const shouldUseRelayE2ee = this.config.e2ee?.enabled === true && isRelayTransport;
-      this.assertEncryptedRelayAuth(selected.helloAuth, isRelayTransport);
-
       let transportFactory = isRelayTransport
         ? createRelayTransportFactory(baseTransportFactory)
         : baseTransportFactory;
@@ -1424,36 +1428,65 @@ export class DaemonClient {
         });
       }
       const transportUrl = this.resolveTransportUrlForAttempt();
-      const transport = transportFactory({
-        url: transportUrl,
-        headers: selected.headers,
-        ...(selected.protocols ? { protocols: selected.protocols } : {}),
-      });
-      this.transport = transport;
-      this.lastServerInfoMessage = null;
-      this.authFailureReasonValue = null;
+      const startConnecting = () => {
+        this.lastServerInfoMessage = null;
+        this.authFailureReasonValue = null;
+        this.updateConnectionState(
+          {
+            status: "connecting",
+            attempt: this.reconnectAttempt,
+          },
+          { event: "CONNECT_REQUEST" },
+        );
+        this.resetConnectTimeout();
+        const timeoutMs = Math.max(1, this.config.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
+        this.connectTimeout = setTimeout(() => {
+          if (this.connectionState.status !== "connecting") {
+            return;
+          }
+          this.lastErrorValue = "Connection timed out";
+          this.disposeTransport(1001, "Connection timed out");
+          this.scheduleReconnect({
+            reason: "Connection timed out",
+            event: "CONNECT_TIMEOUT",
+            reasonCode: "connect_timeout",
+          });
+        }, timeoutMs);
+      };
 
-      this.updateConnectionState(
-        {
-          status: "connecting",
-          attempt: this.reconnectAttempt,
-        },
-        { event: "CONNECT_REQUEST" },
-      );
-      this.resetConnectTimeout();
-      const timeoutMs = Math.max(1, this.config.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
-      this.connectTimeout = setTimeout(() => {
-        if (this.connectionState.status !== "connecting") {
-          return;
-        }
-        this.lastErrorValue = "Connection timed out";
-        this.disposeTransport(1001, "Connection timed out");
-        this.scheduleReconnect({
-          reason: "Connection timed out",
-          event: "CONNECT_TIMEOUT",
-          reasonCode: "connect_timeout",
+      const shouldOverlapIdentityAndRelayConnect =
+        resolution instanceof Promise &&
+        typeof this.config.identityTokenProvider === "function" &&
+        isRelayTransport &&
+        shouldUseRelayE2ee;
+      if (shouldOverlapIdentityAndRelayConnect) {
+        // Relay E2EE keeps the Identity token inside HELLO, so the unauthenticated
+        // WebSocket and E2EE handshake can proceed while Gramsrv obtains that token.
+        this.disposeTransport();
+        startConnecting();
+        prefetchedTransport = transportFactory({ url: transportUrl });
+        this.transport = prefetchedTransport;
+      }
+
+      const selected = resolution instanceof Promise ? await resolution : resolution;
+      if (!this.shouldReconnect) return;
+      if (prefetchedTransport && this.transport !== prefetchedTransport) return;
+      this.helloAuth = selected.helloAuth;
+      this.assertEncryptedRelayAuth(selected.helloAuth, isRelayTransport);
+
+      let transport = prefetchedTransport;
+      if (!transport) {
+        // Reconnect can overlap with browser close/error delivery ordering.
+        // Always dispose previous transport before constructing the next one.
+        this.disposeTransport();
+        transport = transportFactory({
+          url: transportUrl,
+          headers: selected.headers,
+          ...(selected.protocols ? { protocols: selected.protocols } : {}),
         });
-      }, timeoutMs);
+        this.transport = transport;
+        startConnecting();
+      }
 
       this.transportCleanup = [
         transport.onOpen(() => {
@@ -1528,6 +1561,9 @@ export class DaemonClient {
       ];
     } catch (error) {
       this.resetConnectTimeout();
+      if (prefetchedTransport && this.transport === prefetchedTransport) {
+        this.disposeTransport(1001, "Connection authentication failed");
+      }
       const message = error instanceof Error ? error.message : "Failed to connect";
       this.lastErrorValue = message;
       this.scheduleReconnect({
@@ -3312,6 +3348,7 @@ export class DaemonClient {
       ...(typeof options.limit === "number" ? { limit: options.limit } : {}),
       ...(options.projection ? { projection: options.projection } : {}),
       ...(options.mergeWindow === true ? { mergeWindow: true } : {}),
+      ...(options.trackDeliveryReceipt === true ? { trackDeliveryReceipt: true } : {}),
     });
 
     const payload = await this.sendRequest({
@@ -3335,6 +3372,18 @@ export class DaemonClient {
     }
 
     return payload;
+  }
+
+  acknowledgeAgentTimelineDelivery(input: {
+    agentId: string;
+    deliveryId: string;
+    epoch: string;
+    seq?: number;
+  }): void {
+    this.sendSessionMessage({
+      type: "agent.timeline.delivery.ack",
+      ...input,
+    });
   }
 
   async appendAgentTimelineItem(
@@ -5419,20 +5468,20 @@ export class DaemonClient {
     const reports: UsageReportEntry[] = [];
     let active = true;
     const unsubscribe = this.subscribeRawMessages((message) => {
-      if (
-        !active ||
-        !("payload" in message) ||
-        !("requestId" in message.payload) ||
-        message.payload.requestId !== requestId
-      )
-        return;
-      if (message.type === "usage.list_reports.response" || message.type === "rpc_error") {
-        active = false;
+      if (!active) return;
+      if (message.type === "usage.list_reports.update") {
+        if (message.payload.requestId !== requestId) return;
+        reports.push(message.payload.report);
+        onReport?.(message.payload.report);
         return;
       }
-      if (message.type !== "usage.list_reports.update") return;
-      reports.push(message.payload.report);
-      onReport?.(message.payload.report);
+      if (message.type === "usage.list_reports.response" || message.type === "rpc_error") {
+        const payload = "payload" in message ? message.payload : undefined;
+        if (payload && "requestId" in payload && payload.requestId === requestId) {
+          active = false;
+        }
+        return;
+      }
     });
     try {
       const response = await this.sendRequest({

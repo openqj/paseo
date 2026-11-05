@@ -92,6 +92,14 @@ const BcryptHashSchema = z.string().regex(/^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/
 const DaemonAuthSchema = z
   .object({
     password: BcryptHashSchema.optional(),
+    identity: z
+      .object({
+        issuerUrl: z.url(),
+        accountId: z.string().min(1).max(128),
+        serverId: z.string().min(1).max(128).optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -542,7 +550,11 @@ export function editPersistedConfig(
   edit: { value: unknown } | { unset: true },
 ): PersistedConfig {
   const parts = configPathParts(field);
-  if (field === "daemon.auth" || field.startsWith("daemon.auth.")) {
+  if (
+    field === "daemon.auth" ||
+    field === "daemon.auth.password" ||
+    (field.startsWith("daemon.auth.") && field !== "daemon.auth.identity")
+  ) {
     throw new Error("Use daemon set-password to change the daemon password.");
   }
   const config = readPersistedConfig(paseoHome, { defaultsIfMissing: true });
